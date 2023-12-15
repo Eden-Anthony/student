@@ -65,7 +65,7 @@ class NMT(nn.Module):
         self.encoder = nn.LSTM(
             input_size=embed_size, hidden_size=hidden_size, bias=True, bidirectional=True)
         self.decoder = nn.LSTMCell(
-            input_size=embed_size, hidden_size=hidden_size, bias=True)  # input may be hidden size
+            input_size=embed_size+hidden_size, hidden_size=hidden_size, bias=True)  # input may be hidden size
         self.h_projection = nn.Linear(
             in_features=2*hidden_size, out_features=hidden_size, bias=False)
         self.c_projection = nn.Linear(
@@ -164,19 +164,17 @@ class NMT(nn.Module):
         enc_hiddens, dec_init_state = None, None
 
         # YOUR CODE HERE (~ 11 Lines)
-        src_len, b = source_padded.shape
-        e = self.model_embeddings.embed_size
         X = self.model_embeddings.source(source_padded)
-        print(f'shape of X: {X.shape}')
+        # Note:permute uses shape indices not dimensions
+        X = X.permute((1, 2, 0))
         X = self.post_embed_cnn(X)
+        X = X.permute((2, 0, 1))
         X = nn.utils.rnn.pack_padded_sequence(
-            input=X, lengths=source_lengths).data
+            input=X, lengths=source_lengths)
         enc_hiddens, (last_hidden, last_cell) = self.encoder(X)
-        print(enc_hiddens.shape, last_hidden.shape, last_cell.shape)
-        h = enc_hiddens.shape[2]/2
         enc_hiddens, _ = nn.utils.rnn.pad_packed_sequence(
             sequence=enc_hiddens)
-        enc_hiddens = torch.permute(enc_hiddens, (b, src_len, h*2))
+        enc_hiddens = torch.permute(enc_hiddens.data, (1, 0, 2))
         init_decoder_hidden = self.h_projection(
             torch.cat((last_hidden[0, :, :], last_hidden[1, :, :]), dim=1))
         init_decoder_cell = self.c_projection(
@@ -254,6 +252,20 @@ class NMT(nn.Module):
         combined_outputs = []
 
         # YOUR CODE HERE (~9 Lines)
+        enc_hiddens_proj = self.att_projection(enc_hiddens)
+        Y = self.model_embeddings.target(target_padded)
+        for Y_t in torch.split(tensor=Y, split_size_or_sections=1, dim=0):
+            Y_t = Y_t.squeeze(dim=0)
+            Ybar_t = torch.cat((Y_t, o_prev), dim=-1)
+            dec_state, o_t, _ = self.step(
+                Ybar_t=Ybar_t,
+                dec_state=dec_state,
+                enc_hiddens=enc_hiddens,
+                enc_hiddens_proj=enc_hiddens_proj,
+                enc_masks=enc_masks)
+            combined_outputs.append(o_t)
+            o_prev = o_t
+        combined_outputs = torch.stack((combined_outputs), dim=0)
         # TODO:
         # 1. Apply the attention projection layer to `enc_hiddens` to obtain `enc_hiddens_proj`,
         # which should be shape (b, src_len, h),
@@ -324,6 +336,11 @@ class NMT(nn.Module):
 
         # YOUR CODE HERE (~3 Lines)
         # TODO:
+        dec_state = self.decoder(Ybar_t, (dec_state))
+        dec_hidden, _ = dec_state
+        e_t = torch.bmm(dec_hidden.unsqueeze(
+            1), enc_hiddens_proj.permute((0, 2, 1)))
+        e_t = e_t.squeeze(1)
         # 1. Apply the decoder to `Ybar_t` and `dec_state`to obtain the new dec_state.
         # 2. Split dec_state into its two parts (dec_hidden, dec_cell)
         # 3. Compute the attention scores e_t, a Tensor shape (b, src_len).
@@ -352,6 +369,12 @@ class NMT(nn.Module):
             e_t.data.masked_fill_(enc_masks.bool(), -float('inf'))
 
         # YOUR CODE HERE (~6 Lines)
+        alpha_t = nn.functional.softmax(e_t, dim=1)
+        a_t = torch.bmm(alpha_t.unsqueeze(1), enc_hiddens)
+        a_t = a_t.squeeze(1)
+        U_t = torch.cat((a_t, dec_hidden), dim=1)
+        V_T = self.combined_output_projection(U_t)
+        O_t = self.dropout(torch.tanh(V_T))
         # TODO:
         # 1. Apply softmax to e_t to yield alpha_t
         # 2. Use batched matrix multiplication between alpha_t and enc_hiddens to obtain the
@@ -522,7 +545,7 @@ class NMT(nn.Module):
         return model
 
     def save(self, path: str):
-        """ Save the odel to a file.
+        """ Save the model to a file.
         @param path (str): path to the model
         """
         print('save model parameters to [%s]' % path, file=sys.stderr)
